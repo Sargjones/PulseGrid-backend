@@ -145,11 +145,31 @@ async def fetch_weather_live() -> dict:
                 stn = props.get("stn_nam") or props.get("station_name")
                 if stn:
                     station_name = stn
-                # Condition (present_weather)
+                # Condition — try present_weather first, then derive from available obs
                 pw = props.get("present_weather", {})
-                pw_val = pw.get("value") if isinstance(pw, dict) else pw
-                if pw_val:
-                    condition = str(pw_val)
+                pw_val = (pw.get("value") if isinstance(pw, dict) else pw)
+                if pw_val and str(pw_val).strip() and str(pw_val).strip() != "NA":
+                    condition = str(pw_val).strip().title()
+                else:
+                    # Derive condition from visibility, precip, and humidity
+                    vis = props.get("visibility", {})
+                    vis_val = vis.get("value") if isinstance(vis, dict) else vis
+                    precip = props.get("pcpn_amt_pst1hr", {})
+                    precip_val = precip.get("value") if isinstance(precip, dict) else precip
+                    hum = hum_val  # already extracted above
+
+                    if precip_val is not None and float(precip_val) > 0:
+                        condition = "Rain" if float(precip_val) < 5 else "Heavy Rain"
+                    elif vis_val is not None and float(vis_val) < 5:
+                        condition = "Fog / Reduced Visibility"
+                    elif hum is not None and float(hum) > 90:
+                        condition = "Overcast / Mist"
+                    elif hum is not None and float(hum) > 75:
+                        condition = "Mostly Cloudy"
+                    elif temp is not None and int(temp) <= 0:
+                        condition = "Cold / Frost Risk"
+                    else:
+                        condition = "Partly Cloudy"
         except Exception as e:
             print(f"SWOB fetch failed: {e}")
 
