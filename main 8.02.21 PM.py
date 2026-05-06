@@ -58,7 +58,8 @@ def cache_set(key: str, data: dict):
     _cache[key] = {"data": data, "ts": time.time()}
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-EC_RSS = "https://weather.gc.ca/rss/city/on-82_e.xml"
+EC_XML = "https://dd.weather.gc.ca/today/citypage_weather/ON/s0000584_e.xml"
+# MSC Datamart — Brantford site code s0000584 (replaces deprecated RSS feed)
 ON511  = "https://511on.ca/api/v2/get/event?lang=en&format=json"
 BRANTFORD_LAT = 43.1394
 BRANTFORD_LNG = -80.2644
@@ -117,58 +118,106 @@ def near_brantford(lat, lng) -> bool:
 
 # ── Weather ───────────────────────────────────────────────────────────────────
 async def fetch_weather_live() -> dict:
-    atom_ns = "http://www.w3.org/2005/Atom"
+    """
+    Fetch weather from MSC Datamart citypage XML.
+    Structured XML with dedicated temperature, condition, and forecast elements.
+    Brantford site code: s0000584
+    """
     async with httpx.AsyncClient(timeout=12) as client:
-        resp = await client.get(EC_RSS, headers={"User-Agent": "PulseGrid/1.0"})
+        resp = await client.get(EC_XML, headers={"User-Agent": "PulseGrid/1.0"})
         resp.raise_for_status()
 
     root = ET.fromstring(resp.text)
-    entries = root.findall(f"{{{atom_ns}}}entry")
 
-    current = None
-    alerts = []
-    forecast = []
-
-    for e in entries:
-        title   = (e.findtext(f"{{{atom_ns}}}title")   or "").strip()
-        summary = strip_html(e.findtext(f"{{{atom_ns}}}summary") or "")
-        tl = title.lower()
-
-        if "current conditions" in tl:
-            current = {
-                "title":   title.replace("Current Conditions: ", "").replace("Current Conditions:", "").strip(),
-                "summary": summary,
-            }
-        elif any(w in tl for w in ["warning", "statement", "watch", "advisory"]):
-            alerts.append({"title": title, "summary": summary})
-        elif any(w in tl for w in ["monday","tuesday","wednesday","thursday","friday",
-                                    "saturday","sunday","today","tonight","this"]):
-            forecast.append({"title": title, "summary": summary})
-
-    # Extract temperature — forecast titles are plaintext, most reliable
+    # ── Current conditions ────────────────────────────────────────────────────
+    cc = root.find(".//currentConditions")
+    temp_el = cc.find("temperature") if cc is not None else None
     temp = None
-    for f in forecast[:2]:
-        temp = extract_temp(f["title"])
-        if temp:
-            break
-    if not temp and current:
-        temp = extract_temp(current["summary"])
+    if temp_el is not None and temp_el.text:
+        try:
+            temp = str(round(float(temp_el.text)))
+        except ValueError:
+            pass
 
-    # Build icon from all available condition text
-    icon_text = " ".join([
-        current.get("title","") if current else "",
-        current.get("summary","") if current else "",
-        forecast[0]["title"] if forecast else "",
-    ])
+    condition_el = cc.find("condition") if cc is not None else None
+    condition = (condition_el.text or "").strip() if condition_el is not None else ""
+
+    station_el = cc.find("station") if cc is not None else None
+    station = (station_el.text or "Brantford Airport").strip() if station_el is not None else "Brantford Airport"
+
+    # Wind for display
+    wind_speed_el = cc.find(".//wind/speed") if cc is not None else None
+    wind_dir_el   = cc.find(".//wind/direction") if cc is not None else None
+    wind_str = ""
+    if wind_speed_el is not None and wind_speed_el.text:
+        wind_str = f"Wind {(wind_dir_el.text or '').strip()} {wind_speed_el.text} km/h"
+
+    # Humidity
+    humidity_el = cc.find("relativeHumidity") if cc is not None else None
+    humidity_str = f"{humidity_el.text}%" if humidity_el is not None and humidity_el.text else ""
+
+    # ── Warnings ──────────────────────────────────────────────────────────────
+    alerts = []
+    warnings_el = root.find(".//warnings")
+    if warnings_el is not None:
+        for event in warnings_el.findall("event"):
+            event_type = event.get("type", "")
+            description = event.get("description", "").strip()
+            if description:
+                alerts.append({
+                    "title":   f"{event_type.title()}: {description}" if event_type else description,
+                    "summary": description,
+                })
+
+    # ── Forecast ──────────────────────────────────────────────────────────────
+    forecast = []
+    forecast_group = root.find(".//forecastGroup")
+    if forecast_group is not None:
+        for fc in forecast_group.findall("forecast"):
+            period_el = fc.find("period")
+            period = (period_el.get("textForecastName","") or "").strip() if period_el is not None else ""
+            text_summary_el = fc.find("textSummary")
+            text_summary = (text_summary_el.text or "").strip() if text_summary_el is not None else ""
+            # High/low temp from forecast
+            temps = fc.findall(".//temperature")
+            temp_parts = []
+            for t in temps:
+                class_ = t.get("class","")
+                val = (t.text or "").strip()
+                if val and class_:
+                    temp_parts.append(f"{class_.title()} {val}°C")
+            temp_display = " · ".join(temp_parts)
+
+            if period and text_summary:
+                forecast.append({
+                    "title":   f"{period}: {text_summary[:60]}",
+                    "summary": text_summary,
+                    "temps":   temp_display,
+                })
+
+    # ── Best temperature for display ──────────────────────────────────────────
+    # Current conditions temp is most accurate; fall back to first forecast high
+    if not temp and forecast:
+        import re
+        for f in forecast[:2]:
+            m = re.search(r"High\s+(-?\d+)", f["title"], re.I)
+            if m:
+                temp = m.group(1)
+                break
+
+    # Build icon text from condition + first forecast
+    icon_text = condition + " " + (forecast[0]["title"] if forecast else "")
 
     return {
         "temperature_c": temp,
         "icon":          wx_icon(icon_text),
-        "condition":     current["title"] if current else "Brantford, ON",
-        "summary":       current["summary"][:200] if current else "",
+        "condition":     condition or "Brantford, ON",
+        "station":       station,
+        "wind":          wind_str,
+        "humidity":      humidity_str,
         "alerts":        alerts,
-        "forecast":      forecast[:4],
-        "source":        "Environment Canada",
+        "forecast":      forecast[:5],
+        "source":        "Environment Canada MSC Datamart",
         "updated":       datetime.now(timezone.utc).isoformat(),
     }
 
